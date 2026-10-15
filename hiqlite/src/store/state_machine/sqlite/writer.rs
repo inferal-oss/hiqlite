@@ -769,6 +769,14 @@ Got:      {}
 
 #[inline]
 fn create_snapshot<P: Into<PathBuf>>(conn: &rusqlite::Connection, path: P) -> Result<(), Error> {
+    create_snapshot_with_sync(conn, path, std::fs::File::sync_data)
+}
+
+fn create_snapshot_with_sync<P: Into<PathBuf>>(
+    conn: &rusqlite::Connection,
+    path: P,
+    mut sync: impl FnMut(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), Error> {
     let mut path = path.into();
     // vacuum into a temp file and move it into place, so a crash can never leave a
     // partially written snapshot at the final path
@@ -787,11 +795,11 @@ fn create_snapshot<P: Into<PathBuf>>(conn: &rusqlite::Connection, path: P) -> Re
         let _ = std::fs::remove_file(&path_temp);
         return Err(Error::Sqlite(err.to_string().into()));
     }
-    std::fs::File::open(&path_temp)?.sync_data();
+    sync(&std::fs::File::open(&path_temp)?)?;
     std::fs::rename(&path_temp, &path)
         .map_err(|err| Error::Error(format!("rename snapshot into place: {err}").into()))?;
     if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_data();
+        sync(&std::fs::File::open(parent)?)?;
     }
     Ok(())
 }
@@ -1058,6 +1066,124 @@ fn apply_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SnapshotTestDir(PathBuf);
+
+    impl SnapshotTestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("hiqlite-snapshot-sync-{}", Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for SnapshotTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn snapshot_test_connection() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE test (value INTEGER); INSERT INTO test VALUES (42);")
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn snapshot_sync_file_error_prevents_publication() {
+        let dir = SnapshotTestDir::new();
+        let conn = snapshot_test_connection();
+        let previous = dir.0.join("previous");
+        create_snapshot(&conn, &previous).unwrap();
+        let previous_bytes = std::fs::read(&previous).unwrap();
+        let next = dir.0.join("next");
+        let mut calls = 0;
+
+        let result = create_snapshot_with_sync(&conn, &next, |file| {
+            calls += 1;
+            if calls == 1 {
+                assert!(file.metadata()?.is_file());
+                Err(std::io::Error::other("injected snapshot file sync failure"))
+            } else {
+                file.sync_data()
+            }
+        });
+
+        assert!(
+            result.is_err(),
+            "snapshot file sync failure must reach the caller"
+        );
+        assert_eq!(
+            calls, 1,
+            "do not sync the directory after a file sync failure"
+        );
+        assert!(
+            !next.exists(),
+            "do not rename a snapshot whose file sync failed"
+        );
+        assert_eq!(std::fs::read(previous).unwrap(), previous_bytes);
+    }
+
+    #[test]
+    fn snapshot_sync_directory_error_rejects_publication() {
+        let dir = SnapshotTestDir::new();
+        let conn = snapshot_test_connection();
+        let previous = dir.0.join("previous");
+        create_snapshot(&conn, &previous).unwrap();
+        let previous_bytes = std::fs::read(&previous).unwrap();
+        let next = dir.0.join("next");
+        let mut calls = 0;
+
+        let result = create_snapshot_with_sync(&conn, &next, |file| {
+            calls += 1;
+            if file.metadata()?.is_dir() {
+                assert!(next.exists(), "directory sync follows the rename");
+                Err(std::io::Error::other(
+                    "injected snapshot directory sync failure",
+                ))
+            } else {
+                file.sync_data()
+            }
+        });
+
+        assert!(
+            result.is_err(),
+            "directory sync failure must reach the caller"
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read(previous).unwrap(), previous_bytes);
+    }
+
+    #[test]
+    fn snapshot_sync_success_preserves_sqlite_contents() {
+        let dir = SnapshotTestDir::new();
+        let conn = snapshot_test_connection();
+        let next = dir.0.join("next");
+        let mut directory_synced = false;
+
+        create_snapshot_with_sync(&conn, &next, |file| {
+            if file.metadata()?.is_dir() {
+                assert!(next.exists());
+                directory_synced = true;
+            } else {
+                assert!(!next.exists());
+            }
+            file.sync_data()
+        })
+        .unwrap();
+
+        assert!(directory_synced);
+        assert!(!dir.0.join("next.tmp").exists());
+        let snapshot = rusqlite::Connection::open(next).unwrap();
+        assert_eq!(
+            snapshot
+                .query_row("SELECT value FROM test", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+    }
 
     #[test]
     fn migration_ts_is_deterministic() {
