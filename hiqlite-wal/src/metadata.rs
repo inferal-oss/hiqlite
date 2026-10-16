@@ -78,7 +78,7 @@ impl Metadata {
         file.write_all(bytes)?;
         // make the data durable *before* the rename, so the rename cannot publish a
         // partially flushed file
-        file.sync_data()?;
+        crate::durability::sync_file(&file, std::path::Path::new(&tmp_path))?;
         drop(file);
 
         // atomic replace: the rename alone publishes the new file, so readers/crash
@@ -88,9 +88,7 @@ impl Metadata {
         // best-effort: make the rename itself durable across power loss
         // TODO we could keep this dir open in the writer and only pass a reference.
         #[cfg(unix)]
-        if let Ok(dir) = File::open(base_path) {
-            let _ = dir.sync_data();
-        }
+        let _ = crate::durability::sync_directory(std::path::Path::new(base_path));
 
         Ok(())
     }
@@ -99,6 +97,38 @@ impl Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::test_io::{FaultGuard, TestDir};
+
+    #[test]
+    fn wal_durability_metadata_directory_error_reaches_caller() {
+        let dir = TestDir::new("metadata-directory-error");
+        let meta = Metadata::read_or_create(dir.as_str()).unwrap();
+        let meta = Arc::new(RwLock::new(meta));
+        meta.write().unwrap().vote = Some(vec![7]);
+        let _fault = FaultGuard::new("sync_directory", 1);
+        assert!(
+            Metadata::write(meta, dir.as_str()).is_err(),
+            "metadata must not acknowledge a failed directory barrier"
+        );
+    }
+
+    #[test]
+    fn wal_durability_metadata_file_error_preserves_previous_vote() {
+        let dir = TestDir::new("metadata-file-error");
+        let meta = Arc::new(RwLock::new(Metadata {
+            last_purged_log_id: None,
+            vote: Some(vec![1]),
+        }));
+        Metadata::write(meta.clone(), dir.as_str()).unwrap();
+        meta.write().unwrap().vote = Some(vec![2]);
+        let fault = FaultGuard::new("sync_file", 1);
+        assert!(Metadata::write(meta, dir.as_str()).is_err());
+        assert_eq!(
+            Metadata::read_or_create(dir.as_str()).unwrap().vote,
+            Some(vec![1])
+        );
+        assert!(!fault.events().iter().any(|(op, _)| *op == "sync_directory"));
+    }
 
     const PATH: &str = "test_data";
 

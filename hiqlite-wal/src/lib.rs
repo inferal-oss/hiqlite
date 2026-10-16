@@ -7,6 +7,7 @@ pub use log_store::{LogStore, LogStoreReader};
 pub use shutdown::ShutdownHandle;
 pub use writer::Action;
 
+mod durability;
 pub mod error;
 mod lockfile;
 mod log_store;

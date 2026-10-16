@@ -455,6 +455,321 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::test_io::{FaultGuard, TestDir};
+
+    fn durability_writer_fixture(base: &str) -> (LockFile, Arc<RwLock<Metadata>>, WalFileSet) {
+        let lock = LockFile::create(base).unwrap();
+        lock.lock().unwrap();
+        let meta = Arc::new(RwLock::new(Metadata::read_or_create(base).unwrap()));
+        let set = WalFileSet::read(base.to_string(), 8192).unwrap();
+        (lock, meta, set)
+    }
+
+    #[test]
+    fn wal_durability_rollover_failure_completes_callback() {
+        let dir = TestDir::new("rollover-callback");
+        let (lock, meta, mut set) = durability_writer_fixture(dir.as_str());
+        set.active().mmap_mut().unwrap();
+        set.active()
+            .append_log(1, &vec![1; 6000], &mut Vec::new())
+            .unwrap();
+        let locked = Arc::new(RwLock::new(set.clone_no_map()));
+        let (tx, rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let _fault = FaultGuard::new("sync_directory", 1);
+            run(lock, meta, locked, set, rx, LogSync::Immediate, 8192)
+        });
+        let (entries, input) = flume::bounded(2);
+        let (ack, response) = oneshot::channel();
+        let (callback, result) = std::sync::mpsc::channel();
+        tx.send(Action::Append {
+            rx: input,
+            ack,
+            callback: Box::new(move |res| {
+                callback.send(res.is_err()).unwrap();
+            }),
+        })
+        .unwrap();
+        entries.send(Some((2, vec![2; 3000]))).unwrap();
+        entries.send(None).unwrap();
+        let acknowledged = response.blocking_recv();
+        let callback_failed = result.recv_timeout(Duration::from_secs(5));
+        drop(tx);
+        let stopped = worker.join().unwrap();
+        assert!(matches!(acknowledged, Ok(Err(_))));
+        assert!(
+            callback_failed.unwrap(),
+            "failed rollover must complete LogFlushed with an error"
+        );
+        assert!(stopped.is_err());
+    }
+
+    #[test]
+    fn wal_durability_vote_error_stops_writer() {
+        let dir = TestDir::new("vote-error");
+        let (lock, meta, set) = durability_writer_fixture(dir.as_str());
+        let locked = Arc::new(RwLock::new(set.clone_no_map()));
+        let (tx, rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let _fault = FaultGuard::new("sync_directory", 1);
+            run(lock, meta, locked, set, rx, LogSync::Immediate, 8192)
+        });
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Vote {
+            value: vec![7],
+            ack,
+        })
+        .unwrap();
+        let acknowledged = response.blocking_recv();
+        drop(tx);
+        assert!(worker.join().unwrap().is_err());
+        assert!(matches!(acknowledged, Ok(Err(_))));
+    }
+
+    #[test]
+    fn wal_durability_purge_metadata_error_prevents_deletion() {
+        let dir = TestDir::new("purge-metadata-error");
+        let (lock, meta, mut set) = durability_writer_fixture(dir.as_str());
+        set.active().mmap_mut().unwrap();
+        for id in 1..=3 {
+            set.active()
+                .append_log(id, b"entry", &mut Vec::new())
+                .unwrap();
+            if id != 3 {
+                set.roll_over(8192, &mut Vec::new()).unwrap();
+            }
+        }
+        let locked = Arc::new(RwLock::new(set.clone_no_map()));
+        let (tx, rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let fault = FaultGuard::new("sync_directory", 1);
+            let result = run(lock, meta, locked, set, rx, LogSync::Immediate, 8192);
+            (result, fault.events())
+        });
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Remove {
+            from: 0,
+            until: 3,
+            last_log: Some(vec![3]),
+            ack,
+        })
+        .unwrap();
+        let acknowledged = response.blocking_recv();
+        drop(tx);
+        let (result, events) = worker.join().unwrap();
+        assert!(matches!(acknowledged, Ok(Err(_))));
+        assert!(result.is_err());
+        assert!(!events.iter().any(|(op, _)| *op == "remove_file"));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for wal_durability_process_crash_roundtrip"]
+    fn wal_durability_crash_helper() {
+        use std::io::Write;
+        let base = std::env::var("HQL_WAL_DURABILITY_TEST_PATH").unwrap();
+        let (lock, meta, set) = durability_writer_fixture(&base);
+        let locked = Arc::new(RwLock::new(set.clone_no_map()));
+        let (tx, rx) = flume::bounded(1);
+        std::thread::spawn(move || run(lock, meta, locked, set, rx, LogSync::Immediate, 8192));
+        let append = |id, bytes: Vec<u8>| {
+            let (entries, input) = flume::bounded(2);
+            let (ack, response) = oneshot::channel();
+            let (flushed, ready) = std::sync::mpsc::channel();
+            tx.send(Action::Append {
+                rx: input,
+                ack,
+                callback: Box::new(move |res| {
+                    flushed.send(res.is_ok()).unwrap();
+                }),
+            })
+            .unwrap();
+            entries.send(Some((id, bytes))).unwrap();
+            entries.send(None).unwrap();
+            response.blocking_recv().unwrap().unwrap();
+            assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
+        };
+        for id in 1..=6 {
+            append(id, vec![id as u8; 1500]);
+        }
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Remove {
+            from: 5,
+            until: u64::MAX,
+            last_log: None,
+            ack,
+        })
+        .unwrap();
+        response.blocking_recv().unwrap().unwrap();
+        append(5, b"replacement".to_vec());
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Remove {
+            from: 0,
+            until: 3,
+            last_log: Some(vec![3]),
+            ack,
+        })
+        .unwrap();
+        response.blocking_recv().unwrap().unwrap();
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Vote {
+            value: vec![7],
+            ack,
+        })
+        .unwrap();
+        response.blocking_recv().unwrap().unwrap();
+        println!("WAL_DURABILITY_READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn wal_durability_process_crash_roundtrip() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let dir = TestDir::new("process-crash");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "writer::tests::wal_durability_crash_helper",
+                "--nocapture",
+            ])
+            .env("HQL_WAL_DURABILITY_TEST_PATH", dir.as_str())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("WAL_DURABILITY_READY") {
+                    let _ = ready.send(());
+                    return;
+                }
+            }
+        });
+        let result = received.recv_timeout(Duration::from_secs(20));
+        // kill before Drop/shutdown can flush or repair anything for the test.
+        let _ = child.kill();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        result.expect("child must reach the acknowledged crash boundary");
+        let metadata = Metadata::read_or_create(dir.as_str()).unwrap();
+        assert_eq!(metadata.vote, Some(vec![7]));
+        assert_eq!(metadata.last_purged_log_id, Some(vec![3]));
+        let mut set = WalFileSet::read(dir.as_str().to_string(), 8192).unwrap();
+        set.check_integrity(&mut Vec::new(), true).unwrap();
+        let mut entries = Vec::new();
+        for file in &mut set.files {
+            if file.data_start.is_none() || file.id_until < 4 {
+                continue;
+            }
+            file.mmap().unwrap();
+            file.read_logs(file.id_from.max(4), file.id_until, &mut None, &mut entries)
+                .unwrap();
+        }
+        assert_eq!(
+            entries,
+            vec![(4, vec![4; 1500]), (5, b"replacement".to_vec())]
+        );
+    }
+
+    #[test]
+    fn wal_durability_partial_purge_keeps_durable_frontier() {
+        let dir = TestDir::new("partial-purge");
+        let base = dir.as_str().to_string();
+        let meta = Arc::new(RwLock::new(Metadata::read_or_create(&base).unwrap()));
+        let lock = LockFile::create(&base).unwrap();
+        lock.lock().unwrap();
+        let mut set = WalFileSet::read(base.clone(), 8192).unwrap();
+        set.active().mmap_mut().unwrap();
+        for id in 1..=3 {
+            set.active()
+                .append_log(id, b"entry", &mut Vec::new())
+                .unwrap();
+            if id != 3 {
+                set.roll_over(8192, &mut Vec::new()).unwrap();
+            }
+        }
+        let locked = Arc::new(RwLock::new(set.clone_no_map()));
+        let (tx, rx) = flume::bounded(1);
+        let worker_meta = meta.clone();
+        let worker = std::thread::spawn(move || {
+            let _fault = FaultGuard::new("remove_file", 2);
+            run(lock, worker_meta, locked, set, rx, LogSync::Immediate, 8192)
+        });
+        let frontier = serialize(&LogId {
+            leader_id: LeaderId::new(1, 1),
+            index: 3,
+        })
+        .unwrap();
+        let (ack, response) = oneshot::channel();
+        tx.send(Action::Remove {
+            from: 0,
+            until: 3,
+            last_log: Some(frontier.clone()),
+            ack,
+        })
+        .unwrap();
+        assert!(response.blocking_recv().unwrap().is_err());
+        drop(tx);
+        let result = worker.join();
+        assert_eq!(
+            Metadata::read_or_create(&base).unwrap().last_purged_log_id,
+            Some(frontier),
+            "never roll the frontier back into already deleted files"
+        );
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "stop after a partial destructive I/O failure"
+        );
+    }
+
+    #[test]
+    fn wal_durability_missing_frontier_is_not_invented() {
+        let dir = TestDir::new("missing-frontier");
+        let base = dir.as_str().to_string();
+        let meta = Arc::new(RwLock::new(Metadata::read_or_create(&base).unwrap()));
+        let mut file = crate::wal::WalFile::new(2, &base, 3, 3, 8192).unwrap();
+        file.create_file(&mut Vec::new()).unwrap();
+        file.mmap_mut().unwrap();
+        let log = serialize(&LogId::<u64> {
+            leader_id: LeaderId::new(3, 1),
+            index: 3,
+        })
+        .unwrap();
+        file.append_log(3, &log, &mut Vec::new()).unwrap();
+        drop(file);
+        let lock = LockFile::create(&base).unwrap();
+        lock.lock().unwrap();
+        let outcome = spawn(
+            base.clone(),
+            lock,
+            LogSync::Immediate,
+            8192,
+            false,
+            meta.clone(),
+        );
+        let failed = outcome.is_err();
+        if let Ok((tx, _)) = outcome {
+            let (ack, response) = oneshot::channel();
+            tx.send(Action::Shutdown(ack)).unwrap();
+            response.blocking_recv().unwrap();
+        }
+        assert!(
+            failed,
+            "do not guess the missing purge frontier from a later term"
+        );
+        assert!(
+            Metadata::read_or_create(&base)
+                .unwrap()
+                .last_purged_log_id
+                .is_none()
+        );
+    }
 
     #[cfg(feature = "oversized-entry-error")]
     fn append(tx: &flume::Sender<Action>, id: u64, bytes: Vec<u8>) -> Result<(), Error> {
@@ -462,7 +777,7 @@ mod tests {
         let (entry_tx, entry_rx) = flume::bounded(1);
         tx.send(Action::Append {
             rx: entry_rx,
-            callback: Box::new(|| {}),
+            callback: Box::new(|_| {}),
             ack: ack_tx,
         })
         .unwrap();

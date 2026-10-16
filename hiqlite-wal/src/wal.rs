@@ -667,7 +667,7 @@ impl WalFile {
         let mut file = File::create_new(&self.path)?;
         file.set_len(self.len_max as u64)?;
         file.write_all(buf)?;
-        file.sync_data()?;
+        crate::durability::sync_file(&file, std::path::Path::new(&self.path))?;
 
         Ok(())
     }
@@ -1047,7 +1047,7 @@ impl WalFileSet {
         if purge_front {
             while !self.files.is_empty() && self.files.front().unwrap().id_until < id_until {
                 let file = self.files.pop_front().unwrap();
-                fs::remove_file(&file.path)?;
+                crate::durability::remove_file(std::path::Path::new(&file.path))?;
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
@@ -1070,7 +1070,7 @@ impl WalFileSet {
         } else if truncate_back {
             while !self.files.is_empty() && self.files.back().unwrap().id_from > id_from {
                 let file = self.files.pop_back().unwrap();
-                fs::remove_file(&file.path)?;
+                crate::durability::remove_file(std::path::Path::new(&file.path))?;
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
@@ -1103,10 +1103,129 @@ impl WalFileSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::test_io::{FaultGuard, TestDir};
     use std::fs;
 
     static PATH: &str = "test_data";
     static MB2: u32 = 2 * 1024 * 1024;
+
+    fn durability_set(dir: &TestDir) -> WalFileSet {
+        let mut set = WalFileSet::read(dir.as_str().to_string(), 8192).unwrap();
+        set.active().mmap_mut().unwrap();
+        let mut buf = Vec::new();
+        for id in 1..=3 {
+            buf.clear();
+            set.active()
+                .append_log(id, b"old payload", &mut buf)
+                .unwrap();
+        }
+        buf.clear();
+        set.active().update_header(&mut buf).unwrap();
+        set.active().flush().unwrap();
+        set
+    }
+
+    #[test]
+    fn wal_durability_segment_directory_error_reaches_caller() {
+        let dir = TestDir::new("segment-directory-error");
+        let mut set = durability_set(&dir);
+        let fault = FaultGuard::new("sync_directory", 1);
+        assert!(
+            set.roll_over(8192, &mut Vec::new()).is_err(),
+            "new segment must cross its directory barrier"
+        );
+        assert_eq!(
+            set.files.len(),
+            1,
+            "failed segment must not enter the published file set"
+        );
+        let events = fault.events();
+        assert!(events.iter().any(|(op, _)| *op == "sync_file"));
+        assert!(events.iter().any(|(op, _)| *op == "sync_directory"));
+    }
+
+    #[test]
+    fn wal_durability_truncate_persists_before_return() {
+        let dir = TestDir::new("truncate-header");
+        let mut set = durability_set(&dir);
+        let path = set.active().path.clone();
+        set.shift_delete_logs(2, u64::MAX, 8192, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
+        // Read while the writer still owns its mapping: Drop must not hide a
+        // missing truncate barrier by flushing on the way out of this test.
+        let reopened = WalFile::read_from_file(path).unwrap();
+        assert_eq!(
+            reopened.id_until, 1,
+            "truncate must persist its new header before returning"
+        );
+    }
+
+    #[test]
+    fn wal_durability_truncate_does_not_resurrect_orphans() {
+        let dir = TestDir::new("truncate-orphans");
+        let mut set = durability_set(&dir);
+        set.shift_delete_logs(2, u64::MAX, 8192, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
+        drop(set);
+        let mut reopened = WalFileSet::read(dir.as_str().to_string(), 8192).unwrap();
+        reopened.check_integrity(&mut Vec::new(), true).unwrap();
+        assert_eq!(
+            reopened.active().id_until,
+            1,
+            "deep recovery must not resurrect deleted suffix entries"
+        );
+    }
+
+    #[test]
+    fn wal_durability_short_replacement_does_not_recover_old_suffix() {
+        let dir = TestDir::new("short-replacement");
+        let mut set = durability_set(&dir);
+        set.shift_delete_logs(2, u64::MAX, 8192, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
+        set.active().append_log(2, b"N", &mut Vec::new()).unwrap();
+        drop(set);
+        let mut reopened = WalFileSet::read(dir.as_str().to_string(), 8192).unwrap();
+        reopened.check_integrity(&mut Vec::new(), true).unwrap();
+        assert_eq!(reopened.active().id_until, 2);
+        let mut entries = Vec::new();
+        reopened
+            .active()
+            .read_logs(2, 2, &mut None, &mut entries)
+            .unwrap();
+        assert_eq!(entries, vec![(2, b"N".to_vec())]);
+    }
+
+    #[test]
+    fn wal_durability_remove_directory_error_reaches_caller() {
+        let dir = TestDir::new("remove-directory");
+        let mut set = durability_set(&dir);
+        let _fault = FaultGuard::new("sync_directory", 1);
+        assert!(
+            set.shift_delete_logs(2, u64::MAX, 8192, &mut Vec::new(), &mut Vec::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wal_durability_unreadable_segment_fails_closed() {
+        for bad_first in [false, true] {
+            let dir = TestDir::new("unreadable-segment");
+            let mut set = durability_set(&dir);
+            set.roll_over(8192, &mut Vec::new()).unwrap();
+            set.active()
+                .append_log(4, b"acknowledged", &mut Vec::new())
+                .unwrap();
+            let index = if bad_first { 0 } else { 1 };
+            let path = set.files[index].path.clone();
+            drop(set);
+            fs::write(&path, b"bad header").unwrap();
+            assert!(
+                WalFileSet::read(dir.as_str().to_string(), 8192).is_err(),
+                "do not silently omit an unreadable segment"
+            );
+            assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+        }
+    }
 
     #[test]
     fn append_read_logs() -> Result<(), Error> {
