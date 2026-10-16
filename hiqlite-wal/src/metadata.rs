@@ -20,6 +20,15 @@ impl Metadata {
         let path = format!("{base_path}/meta.hql");
 
         if !fs::exists(&path)? {
+            for entry in fs::read_dir(base_path)? {
+                if entry?
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "wal")
+                {
+                    return Err(Error::FileCorrupted("metadata is missing beside existing WAL files; explicit recovery is required".into()));
+                }
+            }
             info!("WAL Metadata does not exist, creating new file: {}", path);
             let slf = Self {
                 last_purged_log_id: None,
@@ -97,6 +106,25 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::durability::test_io::{FaultGuard, TestDir};
+
+    #[test]
+    fn wal_durability_missing_metadata_does_not_reset_votes() {
+        let dir = TestDir::new("missing-metadata");
+        let meta = Arc::new(RwLock::new(Metadata {
+            last_purged_log_id: None,
+            vote: Some(vec![7]),
+        }));
+        Metadata::write(meta, dir.as_str()).unwrap();
+        let segment = dir.0.join("0000000000000001.wal");
+        std::fs::write(&segment, b"retained WAL bytes").unwrap();
+        std::fs::remove_file(dir.0.join("meta.hql")).unwrap();
+        assert!(
+            Metadata::read_or_create(dir.as_str()).is_err(),
+            "missing metadata beside existing logs must not reset the vote"
+        );
+        assert!(!dir.0.join("meta.hql").exists());
+        assert_eq!(std::fs::read(segment).unwrap(), b"retained WAL bytes");
+    }
 
     #[test]
     fn wal_durability_metadata_directory_error_reaches_caller() {

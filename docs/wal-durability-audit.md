@@ -35,8 +35,8 @@ git switch fix/wal-durability
 cargo test -p hiqlite-wal --features auto-heal --lib wal_durability -- --nocapture
 ```
 
-The fixed version passes all 15 directly runnable regressions. The complete WAL
-suite passes 29 tests; its one ignored helper is exercised by the crash test.
+The fixed version passes all 16 directly runnable regressions. The complete WAL
+suite passes 30 tests; its one ignored helper is exercised by the crash test.
 The all-feature suite, including the crash test, also passes on Linux AMD64.
 Hiqlite in this fork uses the sibling WAL crate, so a Git dependency on the fork
 does not silently retain the unpatched registry WAL package.
@@ -53,6 +53,8 @@ does not silently retain the unpatched registry WAL package.
   the durable frontier and stop the writer.
 - Startup silently omits existing unreadable segments. Fail closed without
   omitting or replacing history.
+- Startup creates fresh metadata beside retained WAL files if `meta.hql` is
+  missing, resetting the stored vote. Reject that layout without modifying it.
 - Legacy repair guesses a purged predecessor's term from a later entry. Require
   explicit recovery instead of inventing history.
 - An early rollover I/O error drops the append's completion callback. Complete
@@ -68,6 +70,13 @@ hooks compile out of production builds and require no credentials, privileged
 mounts, external services or global environment mutations. Tests also cover
 successful publication, replacement with a shorter entry, failure before purge
 deletion, callback completion and new directory hierarchy publication.
+
+The additional missing-metadata regression can be reproduced by removing the
+existing-WAL guard from `Metadata::read_or_create` and running:
+
+```sh
+cargo test -p hiqlite-wal --features auto-heal --lib wal_durability_missing_metadata
+```
 
 ## Storage contract and limits
 
