@@ -463,41 +463,43 @@ mod tests {
 
     #[test]
     fn wal_durability_rollover_failure_completes_callback() {
-        let dir = TestDir::new("rollover-callback");
-        let (lock, meta, mut set) = durability_writer_fixture(dir.as_str());
-        set.active().mmap_mut().unwrap();
-        set.active()
-            .append_log(1, &vec![1; 6000], &mut Vec::new())
+        for operation in ["sync_file", "sync_directory"] {
+            let dir = TestDir::new("rollover-callback");
+            let (lock, meta, mut set) = durability_writer_fixture(dir.as_str());
+            set.active().mmap_mut().unwrap();
+            set.active()
+                .append_log(1, &vec![1; 6000], &mut Vec::new())
+                .unwrap();
+            let locked = Arc::new(RwLock::new(set.clone_no_map()));
+            let (tx, rx) = flume::bounded(1);
+            let worker = std::thread::spawn(move || {
+                let _fault = FaultGuard::new(operation, 1);
+                run(lock, meta, locked, set, rx, LogSync::Immediate, 8192)
+            });
+            let (entries, input) = flume::bounded(2);
+            let (ack, response) = oneshot::channel();
+            let (callback, result) = std::sync::mpsc::channel();
+            tx.send(Action::Append {
+                rx: input,
+                ack,
+                callback: Box::new(move |res| {
+                    callback.send(res.is_err()).unwrap();
+                }),
+            })
             .unwrap();
-        let locked = Arc::new(RwLock::new(set.clone_no_map()));
-        let (tx, rx) = flume::bounded(1);
-        let worker = std::thread::spawn(move || {
-            let _fault = FaultGuard::new("sync_directory", 1);
-            run(lock, meta, locked, set, rx, LogSync::Immediate, 8192)
-        });
-        let (entries, input) = flume::bounded(2);
-        let (ack, response) = oneshot::channel();
-        let (callback, result) = std::sync::mpsc::channel();
-        tx.send(Action::Append {
-            rx: input,
-            ack,
-            callback: Box::new(move |res| {
-                callback.send(res.is_err()).unwrap();
-            }),
-        })
-        .unwrap();
-        entries.send(Some((2, vec![2; 3000]))).unwrap();
-        entries.send(None).unwrap();
-        let acknowledged = response.blocking_recv();
-        let callback_failed = result.recv_timeout(Duration::from_secs(5));
-        drop(tx);
-        let stopped = worker.join().unwrap();
-        assert!(matches!(acknowledged, Ok(Err(_))));
-        assert!(
-            callback_failed.unwrap(),
-            "failed rollover must complete LogFlushed with an error"
-        );
-        assert!(stopped.is_err());
+            entries.send(Some((2, vec![2; 3000]))).unwrap();
+            let _ = entries.send(None);
+            let acknowledged = response.blocking_recv();
+            let callback_failed = result.recv_timeout(Duration::from_secs(5));
+            drop(tx);
+            let stopped = worker.join().unwrap();
+            assert!(matches!(acknowledged, Ok(Err(_))));
+            assert!(
+                callback_failed.unwrap(),
+                "failed rollover must complete LogFlushed with an error"
+            );
+            assert!(stopped.is_err());
+        }
     }
 
     #[test]
