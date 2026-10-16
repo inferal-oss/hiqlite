@@ -1,9 +1,10 @@
 use crate::error::Error;
 use crate::lockfile::LockFile;
-use crate::log_store_impl::{deserialize, serialize};
+#[cfg(test)]
+use crate::log_store_impl::serialize;
 use crate::metadata::Metadata;
-use crate::reader::LogReadMemo;
 use crate::wal::WalFileSet;
+#[cfg(test)]
 use openraft::{LeaderId, LogId};
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
@@ -13,7 +14,7 @@ use thread_priority::ThreadPriority;
 use tokio::sync::oneshot;
 use tokio::time::Interval;
 use tokio::{task, time};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 pub enum Action {
     Append {
@@ -101,32 +102,16 @@ pub fn spawn(
     }
     let wal_locked = Arc::new(RwLock::new(set.clone_no_map()));
 
-    // TODO remove with version > 0.14
-    // This is a fix for a bug from previous versions. Can be removed in later ones,
-    // it would be safe to do probably around version >= 0.13.
+    // A later log ID does not identify the term of its purged predecessor.
+    // Legacy metadata repair guessed that term and could invent Raft history.
     if meta.read()?.last_purged_log_id.is_none()
-        && let Some(front) = set.files.front_mut()
+        && let Some(front) = set.files.front()
         && front.wal_no > 1
         && front.id_from > 2
     {
-        warn!("Trying to fix bad LogState for `last_purged_logid`");
-        let mut buf = Vec::with_capacity(16);
-        let mut memo: Option<LogReadMemo> = None;
-        front.mmap()?;
-        front.read_logs(front.id_from, front.id_until, &mut memo, &mut buf)?;
-        let (_, bytes) = buf.first().unwrap();
-        let log: openraft::log_id::LogId<u64> = deserialize(bytes)?;
-        let log_id: openraft::log_id::LogId<u64> = LogId {
-            leader_id: LeaderId {
-                term: log.leader_id.term,
-                node_id: log.leader_id.node_id,
-            },
-            index: log.index - 1,
-        };
-        front.mmap_drop();
-
-        meta.write()?.last_purged_log_id = Some(serialize(&log_id)?);
-        Metadata::write(meta.clone(), &set.base_path)?;
+        return Err(Error::Integrity(
+            "missing purge frontier for retained WAL prefix; explicit recovery is required".into(),
+        ));
     }
 
     let (tx, rx) = flume::bounded::<Action>(1);
@@ -209,6 +194,7 @@ fn run(
                 debug!("WAL Writer - Action::Append");
 
                 let mut res = Ok(());
+                let mut fatal_append = None;
                 {
                     let mut active = wal.active();
 
@@ -252,7 +238,11 @@ fn run(
 
                         if !active.has_space(bytes.len() as u32) {
                             buf.clear();
-                            wal.roll_over(wal_size, &mut buf)?;
+                            if let Err(err) = wal.roll_over(wal_size, &mut buf) {
+                                fatal_append = Some(err.to_string());
+                                res = Err(err);
+                                break;
+                            }
                             {
                                 let mut lock = wal_locked.write().unwrap();
                                 lock.active = wal.active;
@@ -263,6 +253,7 @@ fn run(
 
                         buf.clear();
                         if let Err(err) = active.append_log(id, &bytes, &mut buf) {
+                            fatal_append = Some(err.to_string());
                             res = Err(err);
                             break;
                         }
@@ -291,6 +282,11 @@ fn run(
                     error!("error sending back ack after logs append: {err:?}");
                 }
 
+                if let Some(error) = fatal_append {
+                    callback(res_cb);
+                    return Err(Error::Internal(error.into()));
+                }
+
                 // The WAL now holds bytes that are not known to be on disk, and only a
                 // blocking flush can clear that state again. `flush_async` merely starts the
                 // writeback, which is why `Action::Remove` and `Action::Vote` below still flush.
@@ -304,7 +300,7 @@ fn run(
                                 data consistency. {err:?}"
                             );
                             callback(Err(io::Error::other(err.to_string())));
-                            break;
+                            return Err(err);
                         }
                     }
                     LogSync::ImmediateAsync => {
@@ -361,17 +357,21 @@ fn run(
                 // so a crash during the removal below can still land after the deletions and
                 // before the header reaches disk, which is the hole this guards against.
                 if let Err(err) = flush_blocking(&mut wal, &mut buf, &mut is_dirty) {
+                    let stop = Error::Internal(err.to_string().into());
                     ack.send(Err(err)).unwrap();
-                    continue;
+                    return Err(stop);
                 }
 
-                // Persist the purge frontier before deleting (too low = hole into deleted files;
-                // too high = extra files). Revert it again if the deletion fails below.
-                let previous_purged = meta.read()?.last_purged_log_id.clone();
+                // Persist before deletion. Once deletion starts, this frontier
+                // must never move backward into history that may already be gone.
                 let persist_purged = last_log.is_some();
                 if persist_purged {
                     meta.write()?.last_purged_log_id = last_log;
-                    Metadata::write(meta.clone(), &wal.base_path)?;
+                    if let Err(err) = Metadata::write(meta.clone(), &wal.base_path) {
+                        let stop = Error::Internal(err.to_string().into());
+                        let _ = ack.send(Err(err));
+                        return Err(stop);
+                    }
                 }
 
                 buf.clear();
@@ -386,24 +386,9 @@ fn run(
                         ack.send(Ok(())).unwrap();
                     }
                     Err(err) => {
-                        if persist_purged {
-                            // deletion failed: revert the frontier, but still report the error
-                            let revert_res = {
-                                // `Metadata::write` re-locks the meta, so release the guard first
-                                let mut m = meta
-                                    .write()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                m.last_purged_log_id = previous_purged;
-                                drop(m);
-                                Metadata::write(meta.clone(), &wal.base_path)
-                            };
-                            if let Err(revert_err) = revert_res {
-                                error!(
-                                    "Failed to revert last_purged_log_id after log deletion failure: {revert_err}"
-                                );
-                            }
-                        }
-                        ack.send(Err(err)).unwrap();
+                        let stop = Error::Internal(err.to_string().into());
+                        let _ = ack.send(Err(err));
+                        return Err(stop);
                     }
                 }
             }
@@ -412,12 +397,23 @@ fn run(
 
                 // Blocking on purpose: clearing `is_dirty` while an msync is still in flight
                 // would make the interval ticker skip a WAL that never reached disk.
-                flush_blocking(&mut wal, &mut buf, &mut is_dirty)?;
+                if let Err(err) = flush_blocking(&mut wal, &mut buf, &mut is_dirty) {
+                    let stop = Error::Internal(err.to_string().into());
+                    let _ = ack.send(Err(err));
+                    return Err(stop);
+                }
 
                 meta.write()?.vote = Some(value);
                 let res = Metadata::write(meta.clone(), &wal.base_path);
 
-                ack.send(res).unwrap();
+                let stop = res
+                    .as_ref()
+                    .err()
+                    .map(|err| Error::Internal(err.to_string().into()));
+                let _ = ack.send(res);
+                if let Some(error) = stop {
+                    return Err(error);
+                }
             }
             Action::Sync => {
                 // The ticker is the only flush in `IntervalMillis` mode and no append waits on

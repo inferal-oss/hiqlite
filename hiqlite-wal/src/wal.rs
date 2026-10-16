@@ -668,6 +668,10 @@ impl WalFile {
         file.set_len(self.len_max as u64)?;
         file.write_all(buf)?;
         crate::durability::sync_file(&file, std::path::Path::new(&self.path))?;
+        let parent = std::path::Path::new(&self.path)
+            .parent()
+            .ok_or(Error::InvalidPath("WAL segment has no parent"))?;
+        crate::durability::sync_directory(parent)?;
 
         Ok(())
     }
@@ -966,14 +970,9 @@ impl WalFileSet {
         let mut files = VecDeque::with_capacity(file_names.len());
         for name in file_names {
             let path_full = format!("{base_path}/{name}");
-            match WalFile::read_from_file(path_full.clone()) {
-                Ok(wal) => files.push_back(wal),
-                Err(err) => warn!(
-                    "Skipping unreadable WAL file {}: {err:?}. The store will start without it; \
-                     if this is not expected, check or remove the file.",
-                    path_full
-                ),
-            }
+            // An unreadable file may contain acknowledged history. Skipping it
+            // silently would turn an I/O/corruption error into a shorter log.
+            files.push_back(WalFile::read_from_file(path_full)?);
         }
 
         let active = if files.is_empty() {
@@ -1046,8 +1045,12 @@ impl WalFileSet {
 
         if purge_front {
             while !self.files.is_empty() && self.files.front().unwrap().id_until < id_until {
-                let file = self.files.pop_front().unwrap();
-                crate::durability::remove_file(std::path::Path::new(&file.path))?;
+                let front = self.files.front_mut().unwrap();
+                front.mmap_mut = None;
+                front.file = None;
+                crate::durability::remove_file(std::path::Path::new(&front.path))?;
+                self.files.pop_front();
+                self.active = self.files.len().checked_sub(1);
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
@@ -1069,8 +1072,12 @@ impl WalFileSet {
             }
         } else if truncate_back {
             while !self.files.is_empty() && self.files.back().unwrap().id_from > id_from {
-                let file = self.files.pop_back().unwrap();
-                crate::durability::remove_file(std::path::Path::new(&file.path))?;
+                let back = self.files.back_mut().unwrap();
+                back.mmap_mut = None;
+                back.file = None;
+                crate::durability::remove_file(std::path::Path::new(&back.path))?;
+                self.files.pop_back();
+                self.active = self.files.len().checked_sub(1);
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
@@ -1079,6 +1086,9 @@ impl WalFileSet {
 
             let back = self.files.back_mut().unwrap();
             if back.id_from == id_from {
+                back.mmap_mut()?;
+                let offset = back.offset_logs();
+                back.mmap_mut.as_mut().unwrap()[offset..].fill(0);
                 back.id_until = id_from;
                 back.data_start = None;
                 back.data_end = None;
@@ -1088,6 +1098,10 @@ impl WalFileSet {
                 }
                 // offset always goes forwards
                 let offset = back.read_logs(id_from, id_from, &mut memo, buf_logs)?;
+                // Deep recovery scans beyond the header for orphaned records.
+                // Clear the suffix so an acknowledged truncation cannot be
+                // undone by that scan, even after a shorter replacement entry.
+                back.mmap_mut.as_mut().unwrap()[offset as usize..].fill(0);
                 back.id_until = id_from - 1;
                 // data_end is inclusive
                 back.data_end = Some(offset - 1);
@@ -1095,6 +1109,17 @@ impl WalFileSet {
         }
 
         self.active = Some(self.files.len() - 1);
+
+        // Remove returns at the durability boundary, not just after changing
+        // in-memory bounds. This includes non-active front headers after purge.
+        for file in &mut self.files {
+            if file.mmap_mut.is_some() {
+                buf.clear();
+                file.update_header(buf)?;
+                file.flush()?;
+            }
+        }
+        crate::durability::sync_directory(std::path::Path::new(&self.base_path))?;
 
         Ok(())
     }

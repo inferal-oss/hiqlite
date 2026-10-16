@@ -4,6 +4,7 @@ use crate::metadata::Metadata;
 use crate::wal::WalFileSet;
 use crate::{LogSync, ShutdownHandle, reader, writer};
 use openraft::RaftTypeConfig;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
@@ -31,7 +32,7 @@ where
     /// Start the LogStore
     pub async fn start(base_path: String, sync: LogSync, wal_size: u32) -> Result<Self, Error> {
         let slf = task::spawn_blocking(move || {
-            fs::create_dir_all(&base_path)?;
+            crate::durability::create_dir_all(std::path::Path::new(&base_path))?;
             #[cfg(target_os = "linux")]
             {
                 use std::os::unix::fs::PermissionsExt;

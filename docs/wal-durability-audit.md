@@ -20,6 +20,27 @@ The ignored `wal_durability_crash_helper` is not a skipped assertion. The proces
 crash test launches it explicitly as a subprocess, waits for acknowledged
 operations, kills it before shutdown or Drop can flush, then reopens the files.
 
+## Reproduce the failures and fixes
+
+The tests-first commit is `51734e6055f79ff38097e1550232650c8ef8d9f4`.
+It preserves the unfixed data paths with private filesystem hooks and produces
+11 failures, four passes and one subprocess helper excluded from direct runs:
+
+```sh
+git clone https://github.com/inferal-oss/hiqlite.git hiqlite-wal-repro
+cd hiqlite-wal-repro
+git switch --detach 51734e6055f79ff38097e1550232650c8ef8d9f4
+cargo test -p hiqlite-wal --features auto-heal --lib wal_durability -- --nocapture
+git switch fix/wal-durability
+cargo test -p hiqlite-wal --features auto-heal --lib wal_durability -- --nocapture
+```
+
+The fixed version passes all 15 directly runnable regressions. The complete WAL
+suite passes 29 tests; its one ignored helper is exercised by the crash test.
+The all-feature suite, including the crash test, also passes on Linux AMD64.
+Hiqlite in this fork uses the sibling WAL crate, so a Git dependency on the fork
+does not silently retain the unpatched registry WAL package.
+
 ## Findings and intended behavior
 
 - Metadata replacement ignores directory sync errors. Return the error before

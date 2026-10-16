@@ -85,10 +85,9 @@ impl Metadata {
         // recovery never see a torn or missing meta file
         fs::rename(&tmp_path, &path)?;
 
-        // best-effort: make the rename itself durable across power loss
+        // The replacement is not durable until its directory barrier succeeds.
         // TODO we could keep this dir open in the writer and only pass a reference.
-        #[cfg(unix)]
-        let _ = crate::durability::sync_directory(std::path::Path::new(base_path));
+        crate::durability::sync_directory(std::path::Path::new(base_path))?;
 
         Ok(())
     }
